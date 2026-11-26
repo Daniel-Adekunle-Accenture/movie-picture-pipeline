@@ -1,0 +1,35 @@
+# Terraform working files, state and variable files (state lives in a private S3 bucket)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+setup/terraform/backend.hcl
+tfplan*
+
+# Dependencies and build output
+node_modules/
+starter/frontend/build/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+
+# Credentials, keys and local environment files
+.env
+.env.*
+.aws/
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+kubeconfig*
+.kube/
+
+# Editor and OS files
+.DS_Store
+.vscode/
