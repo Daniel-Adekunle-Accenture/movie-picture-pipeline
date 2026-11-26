@@ -1,0 +1,103 @@
+name: Frontend Continuous Integration
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'starter/frontend/**'
+      - '.github/workflows/frontend-ci.yaml'
+  workflow_dispatch:
+
+# CI only reads the code. It needs no AWS credentials and no write access.
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: starter/frontend
+
+env:
+  # CI only builds the image, so it points at the default local backend.
+  REACT_APP_MOVIE_API_URL: http://localhost:5000
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js (version from .nvmrc, npm cache)
+        uses: actions/setup-node@v5
+        with:
+          node-version-file: starter/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: starter/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js (version from .nvmrc, npm cache)
+        uses: actions/setup-node@v5
+        with:
+          node-version-file: starter/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: starter/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+        env:
+          CI: true
+
+  build:
+    name: Build Docker image
+    # Runs only after both lint and test succeed.
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js (version from .nvmrc, npm cache)
+        uses: actions/setup-node@v5
+        with:
+          node-version-file: starter/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: starter/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Pre-pull the Dockerfile base image
+        # public.ecr.aws rate-limits anonymous pulls from shared runner IPs (HTTP 429).
+        # Its docker/library images mirror Docker Hub's official images, so fall back to
+        # the same image on Docker Hub and tag it with the name the Dockerfile uses.
+        run: |
+          BASE=$(awk 'toupper($1)=="FROM" {print $2; exit}' Dockerfile)
+          SRC="docker.io/library/${BASE#public.ecr.aws/docker/library/}"
+          docker pull "$BASE" || { docker pull "$SRC" && docker tag "$SRC" "$BASE"; }
+
+      - name: Build the application with Docker
+        run: |
+          docker build \
+            --build-arg REACT_APP_MOVIE_API_URL="${REACT_APP_MOVIE_API_URL}" \
+            --tag "mp-frontend:${GITHUB_SHA}" \
+            .

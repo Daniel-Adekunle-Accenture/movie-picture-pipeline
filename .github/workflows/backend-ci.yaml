@@ -1,0 +1,97 @@
+name: Backend Continuous Integration
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'starter/backend/**'
+      - '.github/workflows/backend-ci.yaml'
+  workflow_dispatch:
+
+# CI only reads the code. It needs no AWS credentials and no write access.
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: starter/backend
+
+env:
+  # Python version comes from the Pipfile ([requires] python_version = "3.10").
+  PYTHON_VERSION: '3.10'
+  PIPENV_VERSION: '2026.6.2'
+  # uWSGI 2.0.21 does not compile with the C23 default of newer GCC on the runner,
+  # so build it with the previous C standard (same fix as starter/backend/Dockerfile).
+  CFLAGS: -std=gnu17
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Python (pipenv cache)
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pipenv
+          cache-dependency-path: starter/backend/Pipfile.lock
+
+      - name: Install pipenv
+        run: python -m pip install "pipenv==${PIPENV_VERSION}"
+
+      - name: Install dependencies from Pipfile.lock
+        run: pipenv install --dev --deploy
+
+      - name: Run linter (flake8)
+        run: pipenv run lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Python (pipenv cache)
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pipenv
+          cache-dependency-path: starter/backend/Pipfile.lock
+
+      - name: Install pipenv
+        run: python -m pip install "pipenv==${PIPENV_VERSION}"
+
+      - name: Install dependencies from Pipfile.lock
+        run: pipenv install --dev --deploy
+
+      - name: Run tests (pytest)
+        run: pipenv run test
+
+  build:
+    name: Build Docker image
+    # Runs only after both lint and test succeed.
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Pre-pull the Dockerfile base image
+        # public.ecr.aws rate-limits anonymous pulls from shared runner IPs (HTTP 429).
+        # Its docker/library images mirror Docker Hub's official images, so fall back to
+        # the same image on Docker Hub and tag it with the name the Dockerfile uses.
+        run: |
+          BASE=$(awk 'toupper($1)=="FROM" {print $2; exit}' Dockerfile)
+          SRC="docker.io/library/${BASE#public.ecr.aws/docker/library/}"
+          docker pull "$BASE" || { docker pull "$SRC" && docker tag "$SRC" "$BASE"; }
+
+      - name: Build the application with Docker
+        run: docker build --tag "mp-backend:${GITHUB_SHA}" .
