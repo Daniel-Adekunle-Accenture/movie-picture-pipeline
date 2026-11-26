@@ -23,4 +23,4 @@ def test_movies_endpoint_returns_valid_data():
         assert "movies" in data
         assert isinstance(data.get("movies"), list)
         assert len(data["movies"]) > 0
-        assert "title" in data["movies"][0]
+        assert "name" in data["movies"][0]  # deliberately wrong: demo of a failing test
