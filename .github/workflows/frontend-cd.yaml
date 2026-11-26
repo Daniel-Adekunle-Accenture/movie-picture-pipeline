@@ -1,0 +1,201 @@
+name: Frontend Continuous Deployment
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'starter/frontend/**'
+      - '.github/workflows/frontend-cd.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: starter/frontend
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER: cluster
+  ECR_REPOSITORY: frontend
+  KUBECTL_VERSION: v1.35.0
+  # Base URL of the deployed backend Service, kept in a repository variable.
+  REACT_APP_MOVIE_API_URL: ${{ vars.REACT_APP_MOVIE_API_URL }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js (version from .nvmrc, npm cache)
+        uses: actions/setup-node@v5
+        with:
+          node-version-file: starter/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: starter/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js (version from .nvmrc, npm cache)
+        uses: actions/setup-node@v5
+        with:
+          node-version-file: starter/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: starter/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+        env:
+          CI: true
+
+  build:
+    name: Build and push image to ECR
+    # Runs only after lint and test succeed, and only for main (manual runs included).
+    needs: [lint, test]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Check the backend URL is set
+        run: |
+          if [ -z "$REACT_APP_MOVIE_API_URL" ]; then
+            echo "::error::Set the REACT_APP_MOVIE_API_URL repository variable to the deployed backend URL"
+            exit 1
+          fi
+          echo "Building against backend $REACT_APP_MOVIE_API_URL"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Pre-pull the Dockerfile base image
+        # public.ecr.aws rate-limits anonymous pulls from shared runner IPs (HTTP 429).
+        # Its docker/library images mirror Docker Hub's official images, so fall back to
+        # the same image on Docker Hub and tag it with the name the Dockerfile uses.
+        run: |
+          BASE=$(awk 'toupper($1)=="FROM" {print $2; exit}' Dockerfile)
+          SRC="docker.io/library/${BASE#public.ecr.aws/docker/library/}"
+          docker pull "$BASE" || { docker pull "$SRC" && docker tag "$SRC" "$BASE"; }
+
+      - name: Build the Docker image tagged with the commit SHA
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          docker build \
+            --build-arg REACT_APP_MOVIE_API_URL="${REACT_APP_MOVIE_API_URL}" \
+            --tag "$IMAGE" \
+            .
+
+      - name: Push the image to ECR
+        id: push
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Pushed \`$IMAGE\` ($(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE" | cut -d@ -f2))" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to EKS
+    # Runs only after the image for this commit was built and pushed.
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # One frontend rollout at a time. A newer run waits instead of cancelling a rollout.
+    concurrency:
+      group: frontend-deploy
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl for the cluster version
+        uses: azure/setup-kubectl@v4
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Update kubeconfig for the EKS cluster
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION"
+
+      - name: Deploy the new image with Kustomize and kubectl
+        working-directory: starter/frontend/k8s
+        run: |
+          test -n "$IMAGE"
+          kustomize version
+          # Only this runner's checkout is edited; the image change is never committed.
+          kustomize edit set image frontend="$IMAGE"
+          kustomize build | kubectl apply -f -
+
+      - name: Wait for the rollout to finish
+        run: kubectl rollout status deployment/frontend --timeout=300s
+
+      - name: Verify the running pods use this commit's image
+        run: |
+          kubectl get pods -l app=frontend --field-selector=status.phase=Running \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.spec.containers[0].image}{"\n"}{end}' | tee pods.txt
+          test "$(kubectl get deployment frontend -o jsonpath='{.spec.template.spec.containers[0].image}')" = "$IMAGE"
+          grep -qF ":${GITHUB_SHA}" pods.txt
+
+      - name: Smoke test the page and the backend URL in the bundle
+        run: |
+          for i in $(seq 1 30); do
+            HOST=$(kubectl get service frontend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            [ -n "$HOST" ] && break
+            sleep 10
+          done
+          test -n "$HOST"
+          URL="http://${HOST}/"
+          # New load balancers can take a few minutes to resolve, so retry for up to 5 minutes.
+          curl --fail --silent --show-error --retry 30 --retry-delay 10 --retry-all-errors --max-time 10 "$URL" -o index.html
+          grep -q '<div id="root">' index.html
+          BUNDLE=$(grep -o '/static/js/main\.[0-9a-f]*\.js' index.html | head -1)
+          curl --fail --silent --show-error --max-time 10 "http://${HOST}${BUNDLE}" | grep -qF "$REACT_APP_MOVIE_API_URL"
+          curl --fail --silent --show-error --max-time 10 "${REACT_APP_MOVIE_API_URL}/movies" | jq -e '.movies | length > 0'
+          {
+            echo "### Frontend deployed"
+            echo "- Image: \`$IMAGE\`"
+            echo "- URL: $URL"
+            echo "- Backend compiled into the bundle: $REACT_APP_MOVIE_API_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
